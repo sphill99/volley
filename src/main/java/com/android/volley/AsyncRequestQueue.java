@@ -1,13 +1,20 @@
 package com.android.volley;
 
+import android.os.Build;
 import android.os.Handler;
 import android.os.Looper;
 import android.os.SystemClock;
 import androidx.annotation.NonNull;
+import androidx.annotation.RequiresApi;
+
 import com.android.volley.AsyncCache.OnGetCompleteCallback;
 import com.android.volley.AsyncNetwork.OnRequestComplete;
 import com.android.volley.Cache.Entry;
+import com.android.volley.toolbox.DiskBasedCache;
+
 import java.util.Comparator;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.PriorityBlockingQueue;
@@ -40,8 +47,16 @@ public class AsyncRequestQueue extends RequestQueue {
 
     public AsyncRequestQueue(
             AsyncCache cache, AsyncNetwork network, ResponseDelivery responseDelivery) {
-        super(cache, network, /* threadPoolSize= */ 0, responseDelivery);
+        super(null, network, /* threadPoolSize= */ 0, responseDelivery);
         mCache = cache;
+        mNetwork = network;
+        mWaitingRequestManager = new WaitingRequestManager(this);
+    }
+
+    public AsyncRequestQueue(
+            Cache cache, AsyncNetwork network, ResponseDelivery responseDelivery) {
+        super(cache, network, /* threadPoolSize= */ 0, responseDelivery);
+        mCache = null;
         mNetwork = network;
         mWaitingRequestManager = new WaitingRequestManager(this);
     }
@@ -84,7 +99,18 @@ public class AsyncRequestQueue extends RequestQueue {
             public void run() {
                 // This is intentionally blocking, because we don't want to process any requests
                 // until the cache is initialized.
-                mCache.initialize();
+                final CountDownLatch latch = new CountDownLatch(1);
+                mCache.initialize(new AsyncCache.OnWriteCompleteCallback() {
+                    @Override
+                    public void onWriteComplete() {
+                        latch.countDown();
+                    }
+                });
+                try {
+                    latch.await();
+                } catch (InterruptedException e) {
+                    // TODO: DO SOMETHING
+                }
             }
         });
     }
@@ -101,7 +127,6 @@ public class AsyncRequestQueue extends RequestQueue {
         }
     }
 
-    @Override
     <T> void beginRequest(Request<T> request) {
         mNonBlockingExecutor.execute(new CacheTask<>(request));
     }
@@ -237,21 +262,28 @@ public class AsyncRequestQueue extends RequestQueue {
 
                     // Parse the response here on the worker thread.
                     // TODO: Move this parsing to a background thread.
-                    Response<?> response = mRequest.parseNetworkResponse(networkResponse);
+                    final Response<?> response = mRequest.parseNetworkResponse(networkResponse);
                     mRequest.addMarker("network-parse-complete");
 
                     // Write to cache if applicable.
                     // TODO: Only update cache metadata instead of entire record for 304s.
                     if (mRequest.shouldCache() && response.cacheEntry != null) {
-                        // TODO: This should be async.
-                        mCache.put(mRequest.getCacheKey(), response.cacheEntry);
-                        mRequest.addMarker("network-cache-written");
+                        mCache.put(mRequest.getCacheKey(), response.cacheEntry, new AsyncCache.OnWriteCompleteCallback() {
+                            @Override
+                            public void onWriteComplete() {
+                                mRequest.addMarker("network-cache-written");
+                                // Post the response back.
+                                mRequest.markDelivered();
+                                getResponseDelivery().postResponse(mRequest, response);
+                                mRequest.notifyListenerResponseReceived(response);
+                            }
+                        });
+                    } else {
+                        // Post the response back.
+                        mRequest.markDelivered();
+                        getResponseDelivery().postResponse(mRequest, response);
+                        mRequest.notifyListenerResponseReceived(response);
                     }
-
-                    // Post the response back.
-                    mRequest.markDelivered();
-                    getResponseDelivery().postResponse(mRequest, response);
-                    mRequest.notifyListenerResponseReceived(response);
                 }
 
                 @Override

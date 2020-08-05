@@ -327,4 +327,12 @@ public class RequestQueue {
             mFinishedListeners.remove(listener);
         }
     }
+
+    ResponseDelivery getResponseDelivery() {
+        return mDelivery;
+    }
+
+    <T> void sendRequestOverNetwork(Request<T> request) {
+        mNetworkQueue.add(request);
+    }
 }

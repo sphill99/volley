@@ -142,6 +142,7 @@ class CacheHeader {
             VolleyLog.e(e, "Failed to read CacheHeader");
             return null;
         } catch (BufferUnderflowException e) {
+            e.printStackTrace();
             VolleyLog.e(e, "Ran out of room while reading from the buffer");
             return null;
         }
