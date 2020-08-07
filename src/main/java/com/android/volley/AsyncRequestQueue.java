@@ -29,6 +29,7 @@ public class AsyncRequestQueue extends RequestQueue {
     private final AsyncCache mAsyncCache;
     private final AsyncNetwork mNetwork;
     private final Cache mCache;
+    private final ExecutorFactory mExecutorFactory;
 
     /** Executor for non-blocking tasks. */
     private ExecutorService mNonBlockingExecutor;
@@ -44,67 +45,42 @@ public class AsyncRequestQueue extends RequestQueue {
     /** Manage list of waiting requests and de-duplicate requests with same cache key. */
     private final WaitingRequestManager mWaitingRequestManager;
 
-    public AsyncRequestQueue(AsyncCache cache, AsyncNetwork network) {
-        this(cache, network, new ExecutorDelivery(new Handler(Looper.getMainLooper())));
-    }
-
-    public AsyncRequestQueue(Cache cache, AsyncNetwork network) {
-        this(cache, network, new ExecutorDelivery(new Handler(Looper.getMainLooper())));
-    }
-
-    public AsyncRequestQueue(
-            AsyncCache cache, AsyncNetwork network, ResponseDelivery responseDelivery) {
-        super(null, network, /* threadPoolSize= */ 0, responseDelivery);
-        mAsyncCache = cache;
-        mNetwork = network;
-        mCache = null;
+    private AsyncRequestQueue(Builder builder) {
+        super(builder.mCache, builder.mNetwork, 0, builder.mResponseDelivery);
+        mAsyncCache = builder.mAsyncCache;
+        mCache = builder.mCache;
+        mNetwork = builder.mNetwork;
+        mExecutorFactory = builder.mExecutorFactor;
         mWaitingRequestManager = new WaitingRequestManager(this);
     }
 
-    public AsyncRequestQueue(
-            Cache cache, AsyncNetwork network, ResponseDelivery responseDelivery) {
-        super(cache, network, /* threadPoolSize= */ 0, responseDelivery);
-        mAsyncCache = null;
-        mNetwork = network;
-        mCache = cache;
-        mWaitingRequestManager = new WaitingRequestManager(this);
-    }
-
-    public AsyncRequestQueue(AsyncCache cache, AsyncNetwork network, ResponseDelivery responseDelivery, ExecutorFactory executorFactory) {
-        super(null, network, 0, responseDelivery);
-        mNonBlockingExecutor = executorFactory.createNonBlockingExecutor()
-
-    }
-
-    public void setmNonBlockingExecutor(ExecutorService nonBlockingExecutor) {
-        mNonBlockingExecutor = nonBlockingExecutor;
-    }
 
     @Override
     public void start() {
         stop(); // Make sure any currently running dispatchers are stopped.
         // TODO: Uncaught exception handler?
-        if (mNonBlockingExecutor == null) {
+        PriorityBlockingQueue blockingQueue = new PriorityBlockingQueue<>(11, new Comparator<Runnable>() {
+            @Override
+            @SuppressWarnings("unchecked")
+            public int compare(Runnable r1, Runnable r2) {
+                // Vanilla runnables are prioritized first, then RequestTasks are ordered
+                // by the underlying Request.
+                if (r1 instanceof RequestTask) {
+                    if (r2 instanceof RequestTask) {
+                        return ((RequestTask) r1).mRequest.compareTo(((RequestTask) r2).mRequest);
+                    }
+                    return 1;
+                }
+                return r2 instanceof RequestTask ? -1 : 0;
+            }
+        });
+        if (mExecutorFactory == null) {
             mNonBlockingExecutor = new ThreadPoolExecutor(
                     /* corePoolSize= */ 0,
                     /* maximumPoolSize= */ 1,
                     /* keepAliveTime= */ 60,
                     /* unit= */ TimeUnit.SECONDS,
-                    new PriorityBlockingQueue<>(11, new Comparator<Runnable>() {
-                        @Override
-                        @SuppressWarnings("unchecked")
-                        public int compare(Runnable r1, Runnable r2) {
-                            // Vanilla runnables are prioritized first, then RequestTasks are ordered
-                            // by the underlying Request.
-                            if (r1 instanceof RequestTask) {
-                                if (r2 instanceof RequestTask) {
-                                    return ((RequestTask) r1).mRequest.compareTo(((RequestTask) r2).mRequest);
-                                }
-                                return 1;
-                            }
-                            return r2 instanceof RequestTask ? -1 : 0;
-                        }
-                    }),
+                    blockingQueue,
                     new ThreadFactory() {
                         @Override
                         public Thread newThread(@NonNull Runnable runnable) {
@@ -113,6 +89,8 @@ public class AsyncRequestQueue extends RequestQueue {
                             return t;
                         }
                     });
+        } else {
+            mNonBlockingExecutor = mExecutorFactory.createNonBlockingExecutor(blockingQueue);
         }
 
         mNonBlockingExecutor.execute(new Runnable() {
@@ -140,11 +118,9 @@ public class AsyncRequestQueue extends RequestQueue {
     public void stop() {
         if (mNonBlockingExecutor != null) {
             mNonBlockingExecutor.shutdownNow();
-            mNonBlockingExecutor = null;
         }
         if (mBlockingExecutor != null) {
             mBlockingExecutor.shutdownNow();
-            mBlockingExecutor = null;
         }
     }
 
@@ -350,6 +326,75 @@ public class AsyncRequestQueue extends RequestQueue {
     public interface ExecutorFactory {
         ExecutorService createNonBlockingExecutor(BlockingQueue<?> taskQueue);
         ExecutorService createBlockingExecutor(BlockingQueue<?> taskQueue);
+    }
+
+    public static class Builder {
+        private final AsyncCache mAsyncCache;
+        private final AsyncNetwork mNetwork;
+        private final Cache mCache;
+        private ExecutorFactory mExecutorFactor;
+        private ResponseDelivery mResponseDelivery;
+
+        public Builder(AsyncNetwork asyncNetwork, AsyncCache asyncCache) {
+            mNetwork = asyncNetwork;
+            mAsyncCache = asyncCache;
+            mCache = new Cache() {
+                @Nullable
+                @Override
+                public Entry get(String key) {
+                    throw new UnsupportedOperationException();
+                }
+
+                @Override
+                public void put(String key, Entry entry) {
+                    throw new UnsupportedOperationException();
+                }
+
+                @Override
+                public void initialize() {
+                    throw new UnsupportedOperationException();
+                }
+
+                @Override
+                public void invalidate(String key, boolean fullExpire) {
+                    throw new UnsupportedOperationException();
+                }
+
+                @Override
+                public void remove(String key) {
+                    throw new UnsupportedOperationException();
+                }
+
+                @Override
+                public void clear() {
+                    throw new UnsupportedOperationException();
+                }
+            };
+            mExecutorFactor = null;
+            mResponseDelivery = new ExecutorDelivery(new Handler(Looper.getMainLooper()));
+        }
+
+        public Builder(AsyncNetwork asyncNetwork, Cache cache) {
+            mNetwork = asyncNetwork;
+            mAsyncCache = null;
+            mCache = cache;
+            mExecutorFactor = null;
+            mResponseDelivery = new ExecutorDelivery(new Handler(Looper.getMainLooper()));
+        }
+
+        public Builder setExecutorFactory(ExecutorFactory executorFactory) {
+            mExecutorFactor = executorFactory;
+            return this;
+        }
+
+        public Builder setResponseDelivery(ResponseDelivery responseDelivery) {
+            mResponseDelivery = responseDelivery;
+            return this;
+        }
+
+        public AsyncRequestQueue build() {
+            return new AsyncRequestQueue(this);
+        }
     }
 
 }
