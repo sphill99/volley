@@ -328,10 +328,6 @@ public class RequestQueue {
         }
     }
 
-    ResponseDelivery getResponseDelivery() {
-        return mDelivery;
-    }
-
     <T> void sendRequestOverNetwork(Request<T> request) {
         mNetworkQueue.add(request);
     }
