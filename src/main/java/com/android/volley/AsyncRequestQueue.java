@@ -61,6 +61,7 @@ public class AsyncRequestQueue extends RequestQueue {
     public void start() {
         stop(); // Make sure any currently running dispatchers are stopped.
         // TODO: Uncaught exception handler?
+        mNetwork
         mNonBlockingExecutor.execute(new Runnable() {
             @Override
             public void run() {

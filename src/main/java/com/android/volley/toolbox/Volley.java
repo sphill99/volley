@@ -21,14 +21,45 @@ import android.content.pm.PackageInfo;
 import android.content.pm.PackageManager.NameNotFoundException;
 import android.net.http.AndroidHttpClient;
 import android.os.Build;
+
+import androidx.annotation.RequiresApi;
+
+import com.android.volley.AsyncCache;
+import com.android.volley.AsyncNetwork;
+import com.android.volley.AsyncRequestQueue;
 import com.android.volley.Network;
 import com.android.volley.RequestQueue;
+import com.android.volley.cronet.CronetHttpStack;
+
 import java.io.File;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 public class Volley {
 
     /** Default on-disk cache directory. */
     private static final String DEFAULT_CACHE_DIR = "volley";
+
+    @RequiresApi(api = Build.VERSION_CODES.O)
+    public static AsyncRequestQueue newAsyncRequestQueue(final Context context) {
+        ExecutorService blocking = Executors.newSingleThreadExecutor();
+        CronetHttpStack stack = new CronetHttpStack(context, Executors.newSingleThreadExecutor(), blocking);
+        AsyncNetwork network = new BasicAsyncNetwork(stack,blocking);
+        FileSupplier cacheSupplier =
+                new FileSupplier() {
+                    private File cacheDir = null;
+
+                    @Override
+                    public File get() {
+                        if (cacheDir == null) {
+                            cacheDir = new File(context.getApplicationContext().getCacheDir(), DEFAULT_CACHE_DIR);
+                        }
+                        return cacheDir;
+                    }
+                };
+        AsyncCache cache = new DiskBasedAsyncCache(cacheSupplier.get(), 5 * 1024 * 1024);
+        return new AsyncRequestQueue.Builder(network).setAsyncCache(cache).build();
+    }
 
     /**
      * Creates a default instance of the worker pool and calls {@link RequestQueue#start()} on it.

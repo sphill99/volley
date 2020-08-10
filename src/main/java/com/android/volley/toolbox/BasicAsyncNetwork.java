@@ -20,7 +20,10 @@ import android.os.Handler;
 import android.os.Looper;
 import android.os.SystemClock;
 import androidx.annotation.Nullable;
+import androidx.annotation.RestrictTo;
+
 import com.android.volley.AsyncNetwork;
+import com.android.volley.AsyncRequestQueue;
 import com.android.volley.AuthFailureError;
 import com.android.volley.Cache;
 import com.android.volley.Cache.Entry;
@@ -71,7 +74,7 @@ public class BasicAsyncNetwork extends AsyncNetwork {
 
     protected final ByteArrayPool mPool;
 
-    protected final ExecutorService mBlockingExecutor;
+    protected ExecutorService mBlockingExecutor;
 
     protected final Handler mHandler;
 
@@ -124,6 +127,11 @@ public class BasicAsyncNetwork extends AsyncNetwork {
         mPool = pool;
         mBlockingExecutor = blockingExecutor;
         mHandler = new Handler(Looper.myLooper());
+    }
+
+    @RestrictTo({RestrictTo.Scope.SUBCLASSES, RestrictTo.Scope.LIBRARY})
+    public void setExecutor(ExecutorService executor) {
+        mBlockingExecutor = executor;
     }
 
     private void onRequestSucceeded(
