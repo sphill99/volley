@@ -1,6 +1,8 @@
 package com.android.volley;
 
+import androidx.annotation.RestrictTo;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.atomic.AtomicReference;
 
 public abstract class AsyncNetwork implements Network {
@@ -13,6 +15,12 @@ public abstract class AsyncNetwork implements Network {
     }
 
     public abstract void performRequest(Request<?> request, OnRequestComplete callback);
+
+    @RestrictTo({RestrictTo.Scope.LIBRARY})
+    public abstract void setBlockingExecutor(ExecutorService executor);
+
+    @RestrictTo({RestrictTo.Scope.LIBRARY})
+    public abstract void setStackCallbackExecutor(ExecutorService executor);
 
     @Override
     public NetworkResponse performRequest(Request<?> request) throws VolleyError {

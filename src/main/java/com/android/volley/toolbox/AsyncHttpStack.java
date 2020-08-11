@@ -1,11 +1,31 @@
+/*
+ * Copyright (C) 2020 The Android Open Source Project
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 package com.android.volley.toolbox;
 
+import androidx.annotation.Nullable;
+import androidx.annotation.RestrictTo;
 import com.android.volley.AuthFailureError;
 import com.android.volley.Request;
 import com.android.volley.VolleyLog;
 import java.io.IOException;
+import java.io.InterruptedIOException;
 import java.util.Map;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.atomic.AtomicReference;
 
 /** Asynchronous extension of the {@link BaseHttpStack} class. */
@@ -33,6 +53,12 @@ public abstract class AsyncHttpStack extends BaseHttpStack {
     public abstract void executeRequest(
             Request<?> request, Map<String, String> additionalHeaders, OnRequestComplete callback);
 
+    @RestrictTo({RestrictTo.Scope.LIBRARY_GROUP})
+    public abstract void setCallbackExecutor(ExecutorService executorService);
+
+    @RestrictTo({RestrictTo.Scope.LIBRARY_GROUP})
+    public abstract void setBlockingExecutor(ExecutorService executorService);
+
     /**
      * Performs an HTTP request with the given parameters.
      *
@@ -48,26 +74,41 @@ public abstract class AsyncHttpStack extends BaseHttpStack {
             Request<?> request, Map<String, String> additionalHeaders)
             throws IOException, AuthFailureError {
         final CountDownLatch latch = new CountDownLatch(1);
-        final AtomicReference<Object> entry = new AtomicReference<>();
+        final AtomicReference<Response> entry = new AtomicReference<>();
         executeRequest(
                 request,
                 additionalHeaders,
                 new OnRequestComplete() {
                     @Override
                     public void onSuccess(HttpResponse httpResponse) {
-                        entry.set(httpResponse);
+                        Response response =
+                                new Response(
+                                        httpResponse,
+                                        /* ioException= */ null,
+                                        /* authFailureError= */ null);
+                        entry.set(response);
                         latch.countDown();
                     }
 
                     @Override
                     public void onAuthError(AuthFailureError authFailureError) {
-                        entry.set(authFailureError);
+                        Response response =
+                                new Response(
+                                        /* httpResponse= */ null,
+                                        /* ioException= */ null,
+                                        authFailureError);
+                        entry.set(response);
                         latch.countDown();
                     }
 
                     @Override
                     public void onError(IOException ioException) {
-                        entry.set(ioException);
+                        Response response =
+                                new Response(
+                                        /* httpResponse= */ null,
+                                        ioException,
+                                        /* authFailureError= */ null);
+                        entry.set(response);
                         latch.countDown();
                     }
                 });
@@ -76,18 +117,30 @@ public abstract class AsyncHttpStack extends BaseHttpStack {
         } catch (InterruptedException e) {
             VolleyLog.e(e, "while waiting for CountDownLatch");
             Thread.currentThread().interrupt();
-            return null;
+            throw new InterruptedIOException(e.toString());
         }
-        Object response = entry.get();
-        if (response instanceof HttpResponse) {
-            return (HttpResponse) response;
-        } else if (response instanceof IOException) {
-            throw (IOException) response;
-        } else if (response instanceof AuthFailureError) {
-            throw (AuthFailureError) response;
+        Response response = entry.get();
+        if (response.httpResponse != null) {
+            return response.httpResponse;
+        } else if (response.ioException != null) {
+            throw response.ioException;
         } else {
-            VolleyLog.d("Response was in an unexpected form");
-            return null;
+            throw response.authFailureError;
+        }
+    }
+
+    private static class Response {
+        HttpResponse httpResponse;
+        IOException ioException;
+        AuthFailureError authFailureError;
+
+        private Response(
+                @Nullable HttpResponse httpResponse,
+                @Nullable IOException ioException,
+                @Nullable AuthFailureError authFailureError) {
+            this.httpResponse = httpResponse;
+            this.ioException = ioException;
+            this.authFailureError = authFailureError;
         }
     }
 }

@@ -12,10 +12,10 @@ class WaitingRequestManager implements Request.NetworkRequestCompleteListener {
      * Staging area for requests that already have a duplicate request in flight.
      *
      * <ul>
-     *   <li>containsKey(cacheKey) indicates that there is a request in flight for the given
-     *       cache key.
-     *   <li>get(cacheKey) returns waiting requests for the given cache key. The in flight
-     *       request is <em>not</em> contained in that list. Is null if no requests are staged.
+     *   <li>containsKey(cacheKey) indicates that there is a request in flight for the given cache
+     *       key.
+     *   <li>get(cacheKey) returns waiting requests for the given cache key. The in flight request
+     *       is <em>not</em> contained in that list. Is null if no requests are staged.
      * </ul>
      */
     private final Map<String, List<Request<?>>> mWaitingRequests = new HashMap<>();
@@ -88,7 +88,7 @@ class WaitingRequestManager implements Request.NetworkRequestCompleteListener {
             } else {
                 try {
                     mNetworkQueue.put(request);
-                } catch(InterruptedException iex){
+                } catch (InterruptedException iex) {
                     VolleyLog.e("Couldn't add request to queue. %s", iex.toString());
                     // Restore the interrupted status of the calling thread (i.e. NetworkDispatcher)
                     Thread.currentThread().interrupt();
@@ -100,11 +100,11 @@ class WaitingRequestManager implements Request.NetworkRequestCompleteListener {
     }
 
     /**
-     * For cacheable requests, if a request for the same cache key is already in flight, add it
-     * to a queue to wait for that in-flight request to finish.
+     * For cacheable requests, if a request for the same cache key is already in flight, add it to a
+     * queue to wait for that in-flight request to finish.
      *
-     * @return whether the request was queued. If false, we should continue issuing the request
-     *     over the network. If true, we should put the request on hold to be processed when the
+     * @return whether the request was queued. If false, we should continue issuing the request over
+     *     the network. If true, we should put the request on hold to be processed when the
      *     in-flight request finishes.
      */
     synchronized boolean maybeAddToWaitingRequests(Request<?> request) {

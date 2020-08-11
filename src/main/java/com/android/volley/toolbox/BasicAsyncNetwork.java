@@ -21,9 +21,7 @@ import android.os.Looper;
 import android.os.SystemClock;
 import androidx.annotation.Nullable;
 import androidx.annotation.RestrictTo;
-
 import com.android.volley.AsyncNetwork;
-import com.android.volley.AsyncRequestQueue;
 import com.android.volley.AuthFailureError;
 import com.android.volley.Cache;
 import com.android.volley.Cache.Entry;
@@ -53,8 +51,6 @@ import java.util.Set;
 import java.util.TreeMap;
 import java.util.TreeSet;
 import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
-import java.util.concurrent.Future;
 
 /** A network performing Volley requests over an {@link HttpStack}. */
 public class BasicAsyncNetwork extends AsyncNetwork {
@@ -80,8 +76,8 @@ public class BasicAsyncNetwork extends AsyncNetwork {
 
     /**
      * @param httpStack HTTP stack to be used
-     * @deprecated use {@link #BasicAsyncNetwork(BaseHttpStack, ExecutorService)} instead to avoid
-     *     depending on Apache HTTP. This method may be removed in a future release of Volley.
+     * @deprecated use {@link #BasicAsyncNetwork(BaseHttpStack)} instead to avoid depending on
+     *     Apache HTTP. This method may be removed in a future release of Volley.
      */
     @Deprecated
     public BasicAsyncNetwork(HttpStack httpStack) {
@@ -93,45 +89,55 @@ public class BasicAsyncNetwork extends AsyncNetwork {
     /**
      * @param httpStack HTTP stack to be used
      * @param pool a buffer pool that improves GC performance in copy operations
-     * @deprecated use {@link #BasicAsyncNetwork(BaseHttpStack, ByteArrayPool, ExecutorService)}
-     *     instead to avoid depending on Apache HTTP. This method may be removed in a future release
-     *     of Volley.
+     * @deprecated use {@link #BasicAsyncNetwork(BaseHttpStack, ByteArrayPool)} instead to avoid
+     *     depending on Apache HTTP. This method may be removed in a future release of Volley.
      */
     @Deprecated
     public BasicAsyncNetwork(HttpStack httpStack, ByteArrayPool pool) {
         mHttpStack = httpStack;
         mBaseHttpStack = new AdaptedHttpStack(httpStack);
         mPool = pool;
-        mBlockingExecutor = Executors.newSingleThreadExecutor();
         mHandler = null;
     }
 
     /** @param httpStack HTTP stack to be used */
-    public BasicAsyncNetwork(BaseHttpStack httpStack, ExecutorService blockingExecutor) {
+    public BasicAsyncNetwork(BaseHttpStack httpStack) {
         // If a pool isn't passed in, then build a small default pool that will give us a lot of
         // benefit and not use too much memory.
-        this(httpStack, new ByteArrayPool(DEFAULT_POOL_SIZE), blockingExecutor);
+        this(httpStack, new ByteArrayPool(DEFAULT_POOL_SIZE));
     }
 
     /**
      * @param httpStack HTTP stack to be used
      * @param pool a buffer pool that improves GC performance in copy operations
      */
-    public BasicAsyncNetwork(
-            BaseHttpStack httpStack, ByteArrayPool pool, ExecutorService blockingExecutor) {
+    public BasicAsyncNetwork(BaseHttpStack httpStack, ByteArrayPool pool) {
         mBaseHttpStack = httpStack;
         // Populate mHttpStack for backwards compatibility, since it is a protected field. However,
         // we won't use it directly here, so clients which don't access it directly won't need to
         // depend on Apache HTTP.
         mHttpStack = httpStack;
         mPool = pool;
-        mBlockingExecutor = blockingExecutor;
         mHandler = new Handler(Looper.myLooper());
     }
 
-    @RestrictTo({RestrictTo.Scope.SUBCLASSES, RestrictTo.Scope.LIBRARY})
-    public void setExecutor(ExecutorService executor) {
+    @RestrictTo({RestrictTo.Scope.LIBRARY})
+    @Override
+    public void setBlockingExecutor(ExecutorService executor) {
         mBlockingExecutor = executor;
+        if (mBaseHttpStack instanceof AsyncHttpStack) {
+            AsyncHttpStack stack = (AsyncHttpStack) mBaseHttpStack;
+            stack.setBlockingExecutor(executor);
+        }
+    }
+
+    @RestrictTo({RestrictTo.Scope.LIBRARY})
+    @Override
+    public void setStackCallbackExecutor(ExecutorService executor) {
+        if (mBaseHttpStack instanceof AsyncHttpStack) {
+            AsyncHttpStack stack = (AsyncHttpStack) mBaseHttpStack;
+            stack.setCallbackExecutor(executor);
+        }
     }
 
     private void onRequestSucceeded(
@@ -175,38 +181,38 @@ public class BasicAsyncNetwork extends AsyncNetwork {
                 // no-content request.
                 responseContents = new byte[0];
             } else {
-                        mBlockingExecutor.execute(
-                                new Runnable() {
-                                    @Override
-                                    public void run() {
-                                        ByteArrayOutputStream bytes = new ByteArrayOutputStream();
-                                        byte[] buffer = new byte[1024];
-                                        int count = 0;
-                                        while (true) {
-                                            try {
-                                                if ((count = inputStream.read(buffer)) == -1) break;
-                                            } catch (IOException e) {
-                                                onRequestFailed(
-                                                        request,
-                                                        callback,
-                                                        e,
-                                                        requestStartMs,
-                                                        httpResponse,
-                                                        bytes.toByteArray());
-                                            }
-                                            bytes.write(buffer, 0, count);
-                                        }
-                                        byte[] finalResponseContents = bytes.toByteArray();
-                                        runAfterBytesReceived(
-                                                requestStartMs,
-                                                statusCode,
-                                                httpResponse,
+                mBlockingExecutor.execute(
+                        new Runnable() {
+                            @Override
+                            public void run() {
+                                ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+                                byte[] buffer = new byte[1024];
+                                int count = 0;
+                                while (true) {
+                                    try {
+                                        if ((count = inputStream.read(buffer)) == -1) break;
+                                    } catch (IOException e) {
+                                        onRequestFailed(
                                                 request,
                                                 callback,
-                                                responseHeaders,
-                                                finalResponseContents);
+                                                e,
+                                                requestStartMs,
+                                                httpResponse,
+                                                bytes.toByteArray());
                                     }
-                                });
+                                    bytes.write(buffer, 0, count);
+                                }
+                                byte[] finalResponseContents = bytes.toByteArray();
+                                runAfterBytesReceived(
+                                        requestStartMs,
+                                        statusCode,
+                                        httpResponse,
+                                        request,
+                                        callback,
+                                        responseHeaders,
+                                        finalResponseContents);
+                            }
+                        });
                 return;
             }
         }
