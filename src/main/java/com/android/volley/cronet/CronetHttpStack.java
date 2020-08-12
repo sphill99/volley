@@ -288,11 +288,12 @@ public class CronetHttpStack extends AsyncHttpStack {
     public static class Builder {
         private static final int DEFAULT_POOL_SIZE = 4096;
         private CronetEngine mCronetEngine;
-        private Context context;
+        private Context mContext;
         private ByteArrayPool mPool;
         private UrlRewriter mUrlRewriter;
 
         public Builder(Context context) {
+            mContext = context;
             mCronetEngine = null;
             mPool = null;
             mUrlRewriter = null;
@@ -318,7 +319,7 @@ public class CronetHttpStack extends AsyncHttpStack {
 
         public CronetHttpStack build() {
             if (mCronetEngine == null) {
-                mCronetEngine = new CronetEngine.Builder(context).build();
+                mCronetEngine = new CronetEngine.Builder(mContext).build();
             }
             if (mUrlRewriter == null) {
                 mUrlRewriter =

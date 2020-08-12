@@ -20,7 +20,7 @@ import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 
 public class AsyncRequestQueue extends RequestQueue {
-
+    private static final int DEFAULT_BLOCKING_THREAD_POOL_SIZE = 4;
     private final AsyncCache mAsyncCache;
     private final AsyncNetwork mNetwork;
     private final Cache mCache;
@@ -28,6 +28,26 @@ public class AsyncRequestQueue extends RequestQueue {
 
     /** Executor for non-blocking tasks. */
     private ExecutorService mNonBlockingExecutor;
+
+    private static final PriorityBlockingQueue<Runnable> mBlockingQueue =
+            new PriorityBlockingQueue<>(
+                    11,
+                    new Comparator<Runnable>() {
+                        @Override
+                        public int compare(Runnable r1, Runnable r2) {
+                            // Vanilla runnables are prioritized first, then RequestTasks are
+                            // ordered
+                            // by the underlying Request.
+                            if (r1 instanceof RequestTask) {
+                                if (r2 instanceof RequestTask) {
+                                    return ((RequestTask<?>) r1)
+                                            .compareTo(((RequestTask<?>) r2));
+                                }
+                                return 1;
+                            }
+                            return r2 instanceof RequestTask ? -1 : 0;
+                        }
+                    });
 
     /**
      * Executor for blocking tasks.
@@ -37,6 +57,9 @@ public class AsyncRequestQueue extends RequestQueue {
      */
     private ExecutorService mBlockingExecutor;
 
+
+    private ExecutorFactory mExecutorFactory;
+
     /** Manage list of waiting requests and de-duplicate requests with same cache key. */
     private final WaitingRequestManager mWaitingRequestManager;
 
@@ -45,24 +68,25 @@ public class AsyncRequestQueue extends RequestQueue {
             AsyncNetwork network,
             @Nullable AsyncCache asyncCache,
             ResponseDelivery responseDelivery,
-            ExecutorService nonBlockingExecutor,
-            ExecutorService blockingExecutor) {
+            @Nullable ExecutorFactory executorFactory) {
         super(cache, network, 0, responseDelivery);
         mAsyncCache = asyncCache;
         mCache = cache;
         mNetwork = network;
-        mNonBlockingExecutor = nonBlockingExecutor;
-        mBlockingExecutor = blockingExecutor;
         mDelivery = responseDelivery;
+        mExecutorFactory = executorFactory;
         mWaitingRequestManager = new WaitingRequestManager(this);
     }
 
     @Override
     public void start() {
-        stop(); // Make sure any currently running dispatchers are stopped.
-        // TODO: Uncaught exception handler?
+        stop(); // Make sure any currently running threads are stopped
+        mNonBlockingExecutor = mExecutorFactory.createNonBlockingExecutor(mBlockingQueue);
+        mBlockingExecutor = mExecutorFactory.createBlockingExecutor(mBlockingQueue);
         mNetwork.setBlockingExecutor(mBlockingExecutor);
         mNetwork.setStackCallbackExecutor(mNonBlockingExecutor);
+
+        // TODO: Uncaught exception handler?
         mNonBlockingExecutor.execute(
                 new Runnable() {
                     @Override
@@ -95,10 +119,21 @@ public class AsyncRequestQueue extends RequestQueue {
     public void stop() {
         if (mNonBlockingExecutor != null) {
             mNonBlockingExecutor.shutdownNow();
+            mNonBlockingExecutor = null;
         }
         if (mBlockingExecutor != null) {
             mBlockingExecutor.shutdownNow();
+            mBlockingExecutor = null;
         }
+    }
+
+    @Override
+    public <T> Request<T> add(Request<T> request) {
+        request.setRequestQueue(this);
+        request.setSequence(getSequenceNumber());
+        request.addMarker("add-to-queue");
+        beginRequest(request);
+        return request;
     }
 
     <T> void beginRequest(Request<T> request) {
@@ -294,17 +329,22 @@ public class AsyncRequestQueue extends RequestQueue {
                                             if (mRequest.shouldCache()
                                                     && response.cacheEntry != null) {
                                                 if (mAsyncCache != null) {
-                                                    mAsyncCache.put(
-                                                            mRequest.getCacheKey(),
-                                                            response.cacheEntry,
-                                                            new AsyncCache
-                                                                    .OnWriteCompleteCallback() {
-                                                                @Override
-                                                                public void onWriteComplete() {
-                                                                    handleRequestAfterCached(
-                                                                            response);
-                                                                }
-                                                            });
+                                                    mNonBlockingExecutor.execute(new Runnable() {
+                                                        @Override
+                                                        public void run() {
+                                                            mAsyncCache.put(
+                                                                    mRequest.getCacheKey(),
+                                                                    response.cacheEntry,
+                                                                    new AsyncCache
+                                                                            .OnWriteCompleteCallback() {
+                                                                        @Override
+                                                                        public void onWriteComplete() {
+                                                                            handleRequestAfterCached(
+                                                                                    response);
+                                                                        }
+                                                                    });
+                                                        }
+                                                    });
                                                 } else {
                                                     mCache.put(
                                                             mRequest.getCacheKey(),
@@ -351,37 +391,15 @@ public class AsyncRequestQueue extends RequestQueue {
 
     public interface ExecutorFactory {
         ExecutorService createNonBlockingExecutor(BlockingQueue<?> taskQueue);
-
         ExecutorService createBlockingExecutor(BlockingQueue<?> taskQueue);
     }
 
     public static class Builder {
-        private static final int DEFAULT_BLOCKING_THREAD_POOL_SIZE = 4;
         private AsyncCache mAsyncCache;
         private final AsyncNetwork mNetwork;
         private Cache mCache;
         private ExecutorFactory mExecutorFactory;
         private ResponseDelivery mResponseDelivery;
-
-        private static final PriorityBlockingQueue<Runnable> mBlockingQueue =
-                new PriorityBlockingQueue<>(
-                        11,
-                        new Comparator<Runnable>() {
-                            @Override
-                            public int compare(Runnable r1, Runnable r2) {
-                                // Vanilla runnables are prioritized first, then RequestTasks are
-                                // ordered
-                                // by the underlying Request.
-                                if (r1 instanceof RequestTask) {
-                                    if (r2 instanceof RequestTask) {
-                                        return ((RequestTask<?>) r1)
-                                                .compareTo(((RequestTask<?>) r2));
-                                    }
-                                    return 1;
-                                }
-                                return r2 instanceof RequestTask ? -1 : 0;
-                            }
-                        });
 
         public Builder(AsyncNetwork asyncNetwork) {
             if (asyncNetwork == null) {
@@ -414,43 +432,44 @@ public class AsyncRequestQueue extends RequestQueue {
             return this;
         }
 
-        private ExecutorService getNonBlockingExecutor() {
-            ExecutorService nonBlockingExecutor;
-            if (mExecutorFactory == null) {
-                nonBlockingExecutor = getThreadPoolExecutor(1, "Volley-NonBlockingExecutor");
-            } else {
-                nonBlockingExecutor = mExecutorFactory.createNonBlockingExecutor(mBlockingQueue);
-            }
-            return nonBlockingExecutor;
-        }
+        private ExecutorFactory getDefaultExecutorFactory() {
+            return new ExecutorFactory() {
+                @Override
+                public ExecutorService createNonBlockingExecutor(BlockingQueue<?> taskQueue) {
+                    return new ThreadPoolExecutor(
+                            /* corePoolSize= */ 0,
+                            /* maximumPoolSize= */ 1,
+                            /* keepAliveTime= */ 60,
+                            /* unit= */ TimeUnit.SECONDS,
+                            mBlockingQueue,
+                            new ThreadFactory() {
+                                @Override
+                                public Thread newThread(@NonNull Runnable runnable) {
+                                    Thread t = Executors.defaultThreadFactory().newThread(runnable);
+                                    t.setName("Volley-NonBlockingExecutor");
+                                    return t;
+                                }
+                            });
+                }
 
-        private ExecutorService getBlockingExecutor() {
-            ExecutorService blockingExecutor;
-            if (mExecutorFactory == null) {
-                blockingExecutor =
-                        getThreadPoolExecutor(
-                                DEFAULT_BLOCKING_THREAD_POOL_SIZE, "Volley-BlockingExecutor");
-            } else {
-                blockingExecutor = mExecutorFactory.createBlockingExecutor(mBlockingQueue);
-            }
-            return blockingExecutor;
-        }
-
-        private ExecutorService getThreadPoolExecutor(int poolSize, final String threadName) {
-            return new ThreadPoolExecutor(
-                    /* corePoolSize= */ 0,
-                    /* maximumPoolSize= */ poolSize,
-                    /* keepAliveTime= */ 60,
-                    /* unit= */ TimeUnit.SECONDS,
-                    mBlockingQueue,
-                    new ThreadFactory() {
-                        @Override
-                        public Thread newThread(@NonNull Runnable runnable) {
-                            Thread t = Executors.defaultThreadFactory().newThread(runnable);
-                            t.setName(threadName);
-                            return t;
-                        }
-                    });
+                @Override
+                public ExecutorService createBlockingExecutor(BlockingQueue<?> taskQueue) {
+                    return new ThreadPoolExecutor(
+                            /* corePoolSize= */ 0,
+                            /* maximumPoolSize= */ DEFAULT_BLOCKING_THREAD_POOL_SIZE,
+                            /* keepAliveTime= */ 60,
+                            /* unit= */ TimeUnit.SECONDS,
+                            mBlockingQueue,
+                            new ThreadFactory() {
+                                @Override
+                                public Thread newThread(@NonNull Runnable runnable) {
+                                    Thread t = Executors.defaultThreadFactory().newThread(runnable);
+                                    t.setName("Volley-BlockingExecutor");
+                                    return t;
+                                }
+                            });
+                }
+            };
         }
 
         public AsyncRequestQueue build() {
@@ -463,13 +482,15 @@ public class AsyncRequestQueue extends RequestQueue {
             if (mResponseDelivery == null) {
                 mResponseDelivery = new ExecutorDelivery(new Handler(Looper.getMainLooper()));
             }
+            if (mExecutorFactory == null) {
+                mExecutorFactory = getDefaultExecutorFactory();
+            }
             return new AsyncRequestQueue(
                     mCache,
                     mNetwork,
                     mAsyncCache,
                     mResponseDelivery,
-                    getNonBlockingExecutor(),
-                    getBlockingExecutor());
+                    mExecutorFactory);
         }
     }
 }

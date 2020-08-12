@@ -25,6 +25,7 @@ import androidx.annotation.RequiresApi;
 import com.android.volley.AsyncCache;
 import com.android.volley.AsyncNetwork;
 import com.android.volley.AsyncRequestQueue;
+import com.android.volley.Cache;
 import com.android.volley.Network;
 import com.android.volley.RequestQueue;
 import com.android.volley.cronet.CronetHttpStack;
@@ -35,27 +36,19 @@ public class Volley {
     /** Default on-disk cache directory. */
     private static final String DEFAULT_CACHE_DIR = "volley";
 
-    @RequiresApi(api = Build.VERSION_CODES.O)
     public static AsyncRequestQueue newAsyncRequestQueue(final Context context) {
         CronetHttpStack stack = new CronetHttpStack.Builder(context).build();
         AsyncNetwork network = new BasicAsyncNetwork(stack);
-        FileSupplier cacheSupplier =
-                new FileSupplier() {
-                    private File cacheDir = null;
-
-                    @Override
-                    public File get() {
-                        if (cacheDir == null) {
-                            cacheDir =
-                                    new File(
-                                            context.getApplicationContext().getCacheDir(),
-                                            DEFAULT_CACHE_DIR);
-                        }
-                        return cacheDir;
-                    }
-                };
-        AsyncCache cache = new DiskBasedAsyncCache(cacheSupplier.get(), 5 * 1024 * 1024);
-        return new AsyncRequestQueue.Builder(network).setAsyncCache(cache).build();
+        File file = new File(
+                context.getApplicationContext().getCacheDir(),
+                DEFAULT_CACHE_DIR);
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            AsyncCache cache = new DiskBasedAsyncCache(file, 5 * 1024 * 1024);
+            return new AsyncRequestQueue.Builder(network).setAsyncCache(cache).build();
+        } else {
+            Cache cache = new DiskBasedCache(file);
+            return new AsyncRequestQueue.Builder(network).setCache(cache).build();
+        }
     }
 
     /**
