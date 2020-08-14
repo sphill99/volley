@@ -51,7 +51,7 @@ public class DiskBasedAsyncCacheTest {
 
     private static final int MAX_SIZE = 1024 * 1024;
 
-    private DiskBasedAsyncCache cache;
+    private DiskBasedAsyncCache2 cache;
 
     private AsyncCache.OnWriteCompleteCallback futureCallback;
 
@@ -70,7 +70,7 @@ public class DiskBasedAsyncCacheTest {
                     }
                 };
         // Initialize empty cache
-        cache = new DiskBasedAsyncCache(temporaryFolder.getRoot(), MAX_SIZE);
+        cache = new DiskBasedAsyncCache2(temporaryFolder.getRoot(), MAX_SIZE);
         cache.initialize(futureCallback);
         future.get();
     }

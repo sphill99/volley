@@ -29,14 +29,21 @@ import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.channels.AsynchronousFileChannel;
 import java.nio.channels.CompletionHandler;
+import java.nio.channels.FileLock;
+import java.nio.file.OpenOption;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.locks.ReadWriteLock;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 
@@ -46,7 +53,7 @@ import java.util.concurrent.locks.ReentrantReadWriteLock;
  */
 @SuppressWarnings("LockNotBeforeTry")
 @RequiresApi(Build.VERSION_CODES.O)
-public class DiskBasedAsyncCache extends AsyncCache {
+public class DiskBasedAsyncCache2 extends AsyncCache {
 
     /** Map of the Key, CacheHeader pairs */
     private final Map<String, LockAndHeader> mEntries = new LinkedHashMap<>(16, .75f, true);
@@ -62,12 +69,14 @@ public class DiskBasedAsyncCache extends AsyncCache {
 
     private final ReadWriteLock entriesMapLock = new ReentrantReadWriteLock();
 
+    private final ExecutorService mBlockingExecutor;
+
     /**
      * Constructs an instance of the DiskBasedAsyncCache at the specified directory.
      *
      * @param rootDirectory The root directory of the cache.
      */
-    public DiskBasedAsyncCache(final File rootDirectory, int maxCacheSizeInBytes) {
+    public DiskBasedAsyncCache2(final File rootDirectory, int maxCacheSizeInBytes) {
         mRootDirectorySupplier =
                 new FileSupplier() {
                     @Override
@@ -76,6 +85,7 @@ public class DiskBasedAsyncCache extends AsyncCache {
                     }
                 };
         mMaxCacheSizeInBytes = maxCacheSizeInBytes;
+        mBlockingExecutor = Executors.newSingleThreadExecutor();
     }
 
     /** Returns the cache entry with the specified key if it exists, null otherwise. */
@@ -96,64 +106,90 @@ public class DiskBasedAsyncCache extends AsyncCache {
 
         // channel we can close after IOException
         AsynchronousFileChannel channel = null;
-        lock.readLock().lock();
+        final AsynchronousFileChannel afc;
         try {
-            final AsynchronousFileChannel afc =
-                    AsynchronousFileChannel.open(path, StandardOpenOption.READ);
-            channel = afc;
-            final int size = (int) file.length();
-            final ByteBuffer buffer = ByteBuffer.allocate(size);
-            afc.read(
-                    /* destination= */ buffer,
-                    /* position= */ 0,
-                    /* attachment= */ null,
-                    new CompletionHandler<Integer, Void>() {
-                        @Override
-                        public void completed(Integer result, Void v) {
-                            closeChannel(afc, "completed read");
-                            if (size != result) {
-                                VolleyLog.e(
-                                        "File changed while reading: %s", file.getAbsolutePath());
-                                deleteFileAndInvokeCallback(key, callback, file);
-                                return;
-                            }
-                            buffer.flip();
-                            CacheHeader entryOnDisk = CacheHeader.readHeader(buffer);
-                            if (entryOnDisk == null) {
-                                // BufferUnderflowException was thrown while reading header
-                                deleteFileAndInvokeCallback(key, callback, file);
-                            } else if (!TextUtils.equals(key, entryOnDisk.key)) {
-                                // File shared by two keys and holds data for a different entry!
-                                VolleyLog.d(
-                                        "%s: key=%s, found=%s",
-                                        file.getAbsolutePath(), key, entryOnDisk.key);
-                                deleteFileAndInvokeCallback(key, callback, file);
-                            } else {
-                                byte[] data = new byte[buffer.remaining()];
-                                buffer.get(data);
-                                callback.onGetComplete(entry.toCacheEntry(data));
-                            }
-                        }
-
-                        @Override
-                        public void failed(Throwable exc, Void ignore) {
-                            closeChannel(afc, "failed read");
-                            VolleyLog.e(exc, "Failed to read file %s", file.getAbsolutePath());
-                            deleteFileAndInvokeCallback(key, callback, file);
-                        }
-                    });
+            afc =
+                    AsynchronousFileChannel.open(
+                            path,
+                            Collections.singleton(StandardOpenOption.READ),
+                            mBlockingExecutor);
         } catch (IOException e) {
             VolleyLog.e(e, "Failed to read file %s", file.getAbsolutePath());
             closeChannel(channel, "IOException");
             deleteFileAndInvokeCallback(key, callback, file);
-        } finally {
-            lock.readLock().unlock();
+            return;
         }
+        mBlockingExecutor.execute(
+                new Runnable() {
+                    @Override
+                    public void run() {
+                        FileLock fileLock;
+                        do {
+                            try {
+                                fileLock = afc.tryLock(0L, Long.MAX_VALUE, true);
+                            } catch (IOException e) {
+                                VolleyLog.e(
+                                        "Failed to retrieve lock for file", file.getAbsolutePath());
+                                closeChannel(afc, "IOException");
+                                deleteFileAndInvokeCallback(key, callback, file);
+                                return;
+                            }
+                        } while (fileLock == null);
+                        final int size = (int) file.length();
+                        final ByteBuffer buffer = ByteBuffer.allocate(size);
+                        afc.read(
+                                /* destination= */ buffer,
+                                /* position= */ 0,
+                                /* attachment= */ null,
+                                new CompletionHandler<Integer, Void>() {
+                                    @Override
+                                    public void completed(Integer result, Void v) {
+                                        closeChannel(afc, "completed read");
+                                        if (size != result) {
+                                            VolleyLog.e(
+                                                    "File changed while reading: %s",
+                                                    file.getAbsolutePath());
+                                            deleteFileAndInvokeCallback(key, callback, file);
+                                            return;
+                                        }
+                                        buffer.flip();
+                                        CacheHeader entryOnDisk = CacheHeader.readHeader(buffer);
+                                        if (entryOnDisk == null) {
+                                            // BufferUnderflowException was thrown
+                                            // while reading header
+                                            deleteFileAndInvokeCallback(key, callback, file);
+                                        } else if (!TextUtils.equals(key, entryOnDisk.key)) {
+                                            // File shared by two keys and holds
+                                            // data for a different entry!
+                                            VolleyLog.d(
+                                                    "%s: key=%s, found=%s",
+                                                    file.getAbsolutePath(), key, entryOnDisk.key);
+                                            deleteFileAndInvokeCallback(key, callback, file);
+                                        } else {
+                                            byte[] data = new byte[buffer.remaining()];
+                                            buffer.get(data);
+                                            callback.onGetComplete(entry.toCacheEntry(data));
+                                        }
+                                    }
+
+                                    @Override
+                                    public void failed(Throwable exc, Void ignore) {
+                                        closeChannel(afc, "failed read");
+                                        VolleyLog.e(
+                                                exc,
+                                                "Failed to read file %s",
+                                                file.getAbsolutePath());
+                                        deleteFileAndInvokeCallback(key, callback, file);
+                                    }
+                                });
+                    }
+                });
     }
 
     /** Puts the cache entry with a specified key into the cache. */
     @Override
-    public void put(final String key, Cache.Entry entry, final OnWriteCompleteCallback callback) {
+    public void put(
+            final String key, final Cache.Entry entry, final OnWriteCompleteCallback callback) {
         if (DiskBasedCacheUtility.wouldBePruned(
                 mTotalSize, entry.data.length, mMaxCacheSizeInBytes)) {
             return;
@@ -168,75 +204,96 @@ public class DiskBasedAsyncCache extends AsyncCache {
         final CacheHeader header = new CacheHeader(key, entry);
 
         entriesMapLock.writeLock().lock();
-        LockAndHeader lockAndHeader = mEntries.get(key);
-        if (lockAndHeader != null) {
-            lock = lockAndHeader.getLock();
-        } else {
-            lock = new ReentrantReadWriteLock();
-        }
-
-        lock.writeLock().lock();
         try {
-            afc =
-                    AsynchronousFileChannel.open(
-                            path, StandardOpenOption.WRITE, StandardOpenOption.CREATE);
-            int headerSize = header.getHeaderSize();
-            final int size = entry.data.length + headerSize;
-            ByteBuffer buffer = ByteBuffer.allocate(size);
-            header.writeHeader(buffer);
-            buffer.put(entry.data);
-            buffer.flip();
-            afc.write(
-                    /* source= */ buffer,
-                    /* position= */ 0,
-                    /* attachment= */ null,
-                    new CompletionHandler<Integer, Void>() {
+            LockAndHeader lockAndHeader = mEntries.get(key);
+            if (lockAndHeader != null) {
+                lock = lockAndHeader.getLock();
+            } else {
+                lock = new ReentrantReadWriteLock();
+            }
+            Set<OpenOption> set = new HashSet<>();
+            set.add(StandardOpenOption.CREATE);
+            set.add(StandardOpenOption.WRITE);
+            afc = AsynchronousFileChannel.open(path, set, mBlockingExecutor);
+            Runnable write =
+                    new Runnable() {
                         @Override
-                        public void completed(Integer resultLen, Void ignore) {
-                            if (closeChannel(afc, "completed write")) {
-                                if (resultLen != size) {
-                                    VolleyLog.e(
-                                            "File changed while writing: %s",
-                                            file.getAbsolutePath());
+                        public void run() {
+                            FileLock fileLock;
+                            do {
+                                try {
+                                    fileLock = afc.tryLock();
+                                } catch (IOException e) {
                                     deleteFile(file);
+                                    initializeIfRootDirectoryDeleted();
                                     callback.onWriteComplete();
                                     return;
                                 }
-                                header.size = resultLen;
-                                mTotalSize =
-                                        DiskBasedCacheUtility.putEntry(
-                                                key,
-                                                new LockAndHeader(header, lock),
-                                                mTotalSize,
-                                                mEntries);
-                                mTotalSize =
-                                        DiskBasedCacheUtility.pruneIfNeeded(
-                                                mTotalSize,
-                                                mMaxCacheSizeInBytes,
-                                                mEntries,
-                                                mRootDirectorySupplier);
-                            } else {
-                                deleteFile(file);
-                            }
+                            } while (fileLock == null);
 
-                            callback.onWriteComplete();
-                        }
+                            int headerSize = header.getHeaderSize();
+                            final int size = entry.data.length + headerSize;
+                            ByteBuffer buffer = ByteBuffer.allocate(size);
+                            header.writeHeader(buffer);
+                            buffer.put(entry.data);
+                            buffer.flip();
+                            entriesMapLock.writeLock().lock();
+                            afc.write(
+                                    /* source= */ buffer,
+                                    /* position= */ 0,
+                                    /* attachment= */ null,
+                                    new CompletionHandler<Integer, Void>() {
+                                        @Override
+                                        public void completed(Integer resultLen, Void ignore) {
+                                            if (closeChannel(afc, "completed write")) {
+                                                if (resultLen != size) {
+                                                    VolleyLog.e(
+                                                            "File changed while writing: %s",
+                                                            file.getAbsolutePath());
+                                                    deleteFile(file);
+                                                    callback.onWriteComplete();
+                                                    return;
+                                                }
+                                                header.size = resultLen;
+                                                mTotalSize =
+                                                        DiskBasedCacheUtility.putEntry(
+                                                                key,
+                                                                new LockAndHeader(header, lock),
+                                                                mTotalSize,
+                                                                mEntries);
+                                                mTotalSize =
+                                                        DiskBasedCacheUtility.pruneIfNeeded(
+                                                                mTotalSize,
+                                                                mMaxCacheSizeInBytes,
+                                                                mEntries,
+                                                                mRootDirectorySupplier);
+                                            } else {
+                                                deleteFile(file);
+                                            }
+                                            entriesMapLock.writeLock().unlock();
+                                            callback.onWriteComplete();
+                                        }
 
-                        @Override
-                        public void failed(Throwable throwable, Void ignore) {
-                            VolleyLog.e(
-                                    throwable, "Failed to read file %s", file.getAbsolutePath());
-                            deleteFile(file);
-                            closeChannel(afc, "failed read");
-                            callback.onWriteComplete();
+                                        @Override
+                                        public void failed(Throwable throwable, Void ignore) {
+                                            VolleyLog.e(
+                                                    throwable,
+                                                    "Failed to read file %s",
+                                                    file.getAbsolutePath());
+                                            deleteFile(file);
+                                            closeChannel(afc, "failed read");
+                                            entriesMapLock.writeLock().unlock();
+                                            callback.onWriteComplete();
+                                        }
+                                    });
                         }
-                    });
+                    };
+            mBlockingExecutor.execute(write);
         } catch (IOException e) {
             deleteFile(file);
             initializeIfRootDirectoryDeleted();
             callback.onWriteComplete();
         } finally {
-            lock.writeLock().unlock();
             entriesMapLock.writeLock().unlock();
         }
     }
@@ -307,14 +364,12 @@ public class DiskBasedAsyncCache extends AsyncCache {
                                 if (entry != null) {
                                     closeChannel(afc, "after successful read");
                                     entry.size = entrySize;
-                                    entriesMapLock.writeLock().lock();
                                     mTotalSize =
                                             DiskBasedCacheUtility.putEntry(
                                                     entry.key,
                                                     new LockAndHeader(entry, lock),
                                                     mTotalSize,
                                                     mEntries);
-                                    entriesMapLock.writeLock().unlock();
                                 } else {
                                     closeChannel(afc, "after failed read");
                                     deleteFile(file);

@@ -10,6 +10,7 @@ import java.nio.BufferUnderflowException;
 import java.nio.ByteBuffer;
 import java.util.Collections;
 import java.util.List;
+import java.util.concurrent.locks.ReadWriteLock;
 
 /** Handles holding onto the cache headers for an entry. */
 class CacheHeader {
@@ -49,6 +50,8 @@ class CacheHeader {
     /** Headers from the response resulting in this cache entry. */
     final List<Header> allResponseHeaders;
 
+    ReadWriteLock lock;
+
     private CacheHeader(
             String key,
             String etag,
@@ -64,6 +67,7 @@ class CacheHeader {
         this.ttl = ttl;
         this.softTtl = softTtl;
         this.allResponseHeaders = allResponseHeaders;
+        this.lock = null;
     }
 
     /**
@@ -120,7 +124,6 @@ class CacheHeader {
      * Reads the header from a ByteBuffer and returns a CacheHeader object.
      *
      * @param buffer Buffer to get header info from.
-     * @throws IOException if fails to read header
      */
     @Nullable
     static CacheHeader readHeader(final ByteBuffer buffer) {
@@ -181,7 +184,7 @@ class CacheHeader {
     }
 
     /** Writes the contents of this CacheHeader to the specified ByteBuffer. */
-    void writeHeader(ByteBuffer buffer) throws IOException {
+    void writeHeader(ByteBuffer buffer) {
         buffer.putInt(CACHE_MAGIC);
         DiskBasedCacheUtility.writeString(buffer, key);
         DiskBasedCacheUtility.writeString(buffer, etag);
@@ -193,12 +196,17 @@ class CacheHeader {
     }
 
     /** Gets the size of the header in bytes. */
-    int getHeaderSize() throws IOException {
+    int getHeaderSize() {
         int size = 0;
-        size += key.getBytes("UTF-8").length;
-        if (etag != null) {
-            size += etag.getBytes("UTF-8").length;
+        try {
+            size += key.getBytes("UTF-8").length;
+            if (etag != null) {
+                size += etag.getBytes("UTF-8").length;
+            }
+        } catch (IOException e) {
+            throw new RuntimeException(e);
         }
+
         size += DiskBasedCacheUtility.headerListSize(allResponseHeaders);
         return size + HEADER_SIZE;
     }

@@ -26,12 +26,14 @@ import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.io.UnsupportedEncodingException;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.locks.ReadWriteLock;
 
 class DiskBasedCacheUtility {
 
@@ -96,7 +98,7 @@ class DiskBasedCacheUtility {
     static long pruneIfNeeded(
             long totalSize,
             int maxCacheSizeInBytes,
-            Map<String, CacheHeader> entries,
+            Map<String, LockAndHeader> entries,
             FileSupplier rootDirectorySupplier) {
         if (!wouldExceedCacheSize(totalSize, maxCacheSizeInBytes)) {
             return totalSize;
@@ -109,10 +111,14 @@ class DiskBasedCacheUtility {
         int prunedFiles = 0;
         long startTime = SystemClock.elapsedRealtime();
 
-        Iterator<Map.Entry<String, CacheHeader>> iterator = entries.entrySet().iterator();
+        Iterator<Map.Entry<String, LockAndHeader>> iterator = entries.entrySet().iterator();
         while (iterator.hasNext()) {
-            Map.Entry<String, CacheHeader> entry = iterator.next();
-            CacheHeader e = entry.getValue();
+            Map.Entry<String, LockAndHeader> entry = iterator.next();
+            CacheHeader e = entry.getValue().getHeader();
+            ReadWriteLock lock = entry.getValue().getLock();
+            if (lock != null) {
+                lock.writeLock().lock();
+            }
             boolean deleted = getFileForKey(e.key, rootDirectorySupplier).delete();
             if (deleted) {
                 totalSize -= e.size;
@@ -122,8 +128,10 @@ class DiskBasedCacheUtility {
                         e.key, getFilenameForKey(e.key));
             }
             iterator.remove();
+            if (lock != null) {
+                lock.writeLock().unlock();
+            }
             prunedFiles++;
-
             if (!doesDataExceedHighWaterMark(totalSize, maxCacheSizeInBytes)) {
                 break;
             }
@@ -148,22 +156,23 @@ class DiskBasedCacheUtility {
      * @return The updated totalSize.
      */
     static long putEntry(
-            String key, CacheHeader entry, long totalSize, Map<String, CacheHeader> entries) {
-        if (!entries.containsKey(key)) {
-            totalSize += entry.size;
+            String key, LockAndHeader entry, long totalSize, Map<String, LockAndHeader> entries) {
+        LockAndHeader lockAndHeader = entries.get(key);
+        if (lockAndHeader == null) {
+            totalSize += entry.getHeader().size;
         } else {
-            CacheHeader oldEntry = entries.get(key);
-            totalSize += (entry.size - oldEntry.size);
+            CacheHeader oldEntry = lockAndHeader.getHeader();
+            totalSize += (entry.getHeader().size - oldEntry.size);
         }
         entries.put(key, entry);
         return totalSize;
     }
 
     /** Removes the entry identified by 'key' from the cache. */
-    static long removeEntry(String key, long totalSize, Map<String, CacheHeader> entries) {
-        CacheHeader removed = entries.remove(key);
+    static long removeEntry(String key, long totalSize, Map<String, LockAndHeader> entries) {
+        LockAndHeader removed = entries.remove(key);
         if (removed != null) {
-            totalSize -= removed.size;
+            totalSize -= removed.getHeader().size;
         }
         return totalSize;
     }
@@ -235,13 +244,18 @@ class DiskBasedCacheUtility {
         os.write(b, 0, b.length);
     }
 
-    static void writeString(ByteBuffer buffer, @Nullable String s) throws IOException {
+    static void writeString(ByteBuffer buffer, @Nullable String s) {
         // if the string is null, put the length as 0.
         if (s == null) {
             buffer.putLong(0);
             return;
         }
-        byte[] b = s.getBytes("UTF-8");
+        byte[] b = new byte[0];
+        try {
+            b = s.getBytes("UTF-8");
+        } catch (UnsupportedEncodingException e) {
+            throw new RuntimeException();
+        }
         buffer.putLong(b.length);
         buffer.put(b);
     }
@@ -274,8 +288,7 @@ class DiskBasedCacheUtility {
         }
     }
 
-    static void writeHeaderList(@Nullable List<Header> headers, ByteBuffer buffer)
-            throws IOException {
+    static void writeHeaderList(@Nullable List<Header> headers, ByteBuffer buffer) {
         if (headers != null) {
             buffer.putInt(headers.size());
             for (Header header : headers) {
@@ -316,18 +329,42 @@ class DiskBasedCacheUtility {
         return result;
     }
 
-    static int headerListSize(@Nullable List<Header> headers) throws IOException {
+    static int headerListSize(@Nullable List<Header> headers) {
         if (headers == null) {
             return 4;
         }
         int bytes = 4;
 
         for (Header header : headers) {
-            bytes += header.getName().getBytes("UTF-8").length;
-            bytes += header.getValue().getBytes("UTF-8").length;
+            try {
+                bytes += header.getName().getBytes("UTF-8").length;
+                bytes += header.getValue().getBytes("UTF-8").length;
+            } catch (UnsupportedEncodingException e) {
+                throw new RuntimeException(e);
+            }
             bytes += 16; // two longs denoting length of strings
         }
 
         return bytes;
+    }
+
+    static class LockAndHeader {
+        private CacheHeader header;
+        @Nullable private ReadWriteLock lock;
+
+        public LockAndHeader(CacheHeader header, @Nullable ReadWriteLock lock) {
+            this.header = header;
+            this.lock = lock;
+        }
+
+        public CacheHeader getHeader() {
+            return header;
+        }
+
+        // Null if non-async cache only!
+        @Nullable
+        public ReadWriteLock getLock() {
+            return lock;
+        }
     }
 }

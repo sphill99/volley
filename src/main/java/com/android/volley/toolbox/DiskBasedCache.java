@@ -20,6 +20,7 @@ import android.text.TextUtils;
 import androidx.annotation.VisibleForTesting;
 import com.android.volley.Cache;
 import com.android.volley.VolleyLog;
+import com.android.volley.toolbox.DiskBasedCacheUtility.LockAndHeader;
 import java.io.BufferedInputStream;
 import java.io.BufferedOutputStream;
 import java.io.DataInputStream;
@@ -43,7 +44,7 @@ import java.util.Map;
 public class DiskBasedCache implements Cache {
 
     /** Map of the Key, CacheHeader pairs */
-    private final Map<String, CacheHeader> mEntries = new LinkedHashMap<>(16, .75f, true);
+    private final Map<String, LockAndHeader> mEntries = new LinkedHashMap<>(16, .75f, true);
 
     /** Total amount of space currently used by the cache in bytes. */
     private long mTotalSize = 0;
@@ -123,11 +124,12 @@ public class DiskBasedCache implements Cache {
     /** Returns the cache entry with the specified key if it exists, null otherwise. */
     @Override
     public synchronized Entry get(String key) {
-        CacheHeader entry = mEntries.get(key);
-        // if the entry does not exist, return.
-        if (entry == null) {
+        final LockAndHeader lockAndHeader = mEntries.get(key);
+        // if the entry does not exist, return null.
+        if (lockAndHeader == null) {
             return null;
         }
+        final CacheHeader entry = lockAndHeader.getHeader();
         File file = DiskBasedCacheUtility.getFileForKey(key, mRootDirectorySupplier);
         try {
             CountingInputStream cis =
@@ -184,7 +186,11 @@ public class DiskBasedCache implements Cache {
                     CacheHeader entry = CacheHeader.readHeader(cis);
                     entry.size = entrySize;
                     mTotalSize =
-                            DiskBasedCacheUtility.putEntry(entry.key, entry, mTotalSize, mEntries);
+                            DiskBasedCacheUtility.putEntry(
+                                    entry.key,
+                                    new LockAndHeader(entry, null),
+                                    mTotalSize,
+                                    mEntries);
                 } finally {
                     // Any IOException thrown here is handled by the below catch block by design.
                     //noinspection ThrowFromFinallyBlock
@@ -236,7 +242,9 @@ public class DiskBasedCache implements Cache {
             fos.write(entry.data);
             fos.close();
             e.size = file.length();
-            mTotalSize = DiskBasedCacheUtility.putEntry(key, e, mTotalSize, mEntries);
+            mTotalSize =
+                    DiskBasedCacheUtility.putEntry(
+                            key, new LockAndHeader(e, null), mTotalSize, mEntries);
             mTotalSize =
                     DiskBasedCacheUtility.pruneIfNeeded(
                             mTotalSize, mMaxCacheSizeInBytes, mEntries, mRootDirectorySupplier);
