@@ -51,7 +51,7 @@ public class DiskBasedAsyncCacheTest {
 
     private static final int MAX_SIZE = 1024 * 1024;
 
-    private DiskBasedAsyncCache2 cache;
+    private DiskBasedAsyncCache cache;
 
     private AsyncCache.OnWriteCompleteCallback futureCallback;
 
@@ -70,7 +70,7 @@ public class DiskBasedAsyncCacheTest {
                     }
                 };
         // Initialize empty cache
-        cache = new DiskBasedAsyncCache2(temporaryFolder.getRoot(), MAX_SIZE);
+        cache = new DiskBasedAsyncCache(temporaryFolder.getRoot(), MAX_SIZE);
         cache.initialize(futureCallback);
         future.get();
     }
@@ -97,6 +97,40 @@ public class DiskBasedAsyncCacheTest {
         putEntry("my-magical-key", entry).get();
 
         CacheTestUtils.assertThatEntriesAreEqual(getEntry("my-magical-key").get(), entry);
+        assertNull(getEntry("unknown-key").get());
+    }
+
+    @Test
+    public void testPutGetZeroBytesLock() throws ExecutionException, InterruptedException {
+        final Cache.Entry entry = new Cache.Entry();
+
+        entry.data = new byte[0];
+        entry.serverDate = 1234567L;
+        entry.lastModified = 13572468L;
+        entry.ttl = 9876543L;
+        entry.softTtl = 8765432L;
+        entry.etag = "etag";
+        entry.responseHeaders = new HashMap<>();
+        entry.responseHeaders.put("fruit", "banana");
+        entry.responseHeaders.put("color", "yellow");
+
+        cache.put(
+                "my-magical-key",
+                entry,
+                new AsyncCache.OnWriteCompleteCallback() {
+                    @Override
+                    public void onWriteComplete() {
+                        // do nothing
+                    }
+                });
+        cache.get(
+                "my-magical-key",
+                new AsyncCache.OnGetCompleteCallback() {
+                    @Override
+                    public void onGetComplete(@Nullable Cache.Entry entry1) {
+                        CacheTestUtils.assertThatEntriesAreEqual(entry1, entry);
+                    }
+                });
         assertNull(getEntry("unknown-key").get());
     }
 

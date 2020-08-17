@@ -98,7 +98,7 @@ class DiskBasedCacheUtility {
     static long pruneIfNeeded(
             long totalSize,
             int maxCacheSizeInBytes,
-            Map<String, LockAndHeader> entries,
+            Map<String, CacheHeader> entries,
             FileSupplier rootDirectorySupplier) {
         if (!wouldExceedCacheSize(totalSize, maxCacheSizeInBytes)) {
             return totalSize;
@@ -111,14 +111,10 @@ class DiskBasedCacheUtility {
         int prunedFiles = 0;
         long startTime = SystemClock.elapsedRealtime();
 
-        Iterator<Map.Entry<String, LockAndHeader>> iterator = entries.entrySet().iterator();
+        Iterator<Map.Entry<String, CacheHeader>> iterator = entries.entrySet().iterator();
         while (iterator.hasNext()) {
-            Map.Entry<String, LockAndHeader> entry = iterator.next();
-            CacheHeader e = entry.getValue().getHeader();
-            ReadWriteLock lock = entry.getValue().getLock();
-            if (lock != null) {
-                lock.writeLock().lock();
-            }
+            Map.Entry<String, CacheHeader> entry = iterator.next();
+            CacheHeader e = entry.getValue();
             boolean deleted = getFileForKey(e.key, rootDirectorySupplier).delete();
             if (deleted) {
                 totalSize -= e.size;
@@ -128,9 +124,6 @@ class DiskBasedCacheUtility {
                         e.key, getFilenameForKey(e.key));
             }
             iterator.remove();
-            if (lock != null) {
-                lock.writeLock().unlock();
-            }
             prunedFiles++;
             if (!doesDataExceedHighWaterMark(totalSize, maxCacheSizeInBytes)) {
                 break;
@@ -156,23 +149,22 @@ class DiskBasedCacheUtility {
      * @return The updated totalSize.
      */
     static long putEntry(
-            String key, LockAndHeader entry, long totalSize, Map<String, LockAndHeader> entries) {
-        LockAndHeader lockAndHeader = entries.get(key);
-        if (lockAndHeader == null) {
-            totalSize += entry.getHeader().size;
+            String key, CacheHeader entry, long totalSize, Map<String, CacheHeader> entries) {
+        CacheHeader oldHeader = entries.get(key);
+        if (oldHeader == null) {
+            totalSize += entry.size;
         } else {
-            CacheHeader oldEntry = lockAndHeader.getHeader();
-            totalSize += (entry.getHeader().size - oldEntry.size);
+            totalSize += (entry.size - oldHeader.size);
         }
         entries.put(key, entry);
         return totalSize;
     }
 
     /** Removes the entry identified by 'key' from the cache. */
-    static long removeEntry(String key, long totalSize, Map<String, LockAndHeader> entries) {
-        LockAndHeader removed = entries.remove(key);
+    static long removeEntry(String key, long totalSize, Map<String, CacheHeader> entries) {
+        CacheHeader removed = entries.remove(key);
         if (removed != null) {
-            totalSize -= removed.getHeader().size;
+            totalSize -= removed.size;
         }
         return totalSize;
     }
