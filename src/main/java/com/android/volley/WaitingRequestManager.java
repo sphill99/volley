@@ -84,10 +84,10 @@ class WaitingRequestManager implements Request.NetworkRequestCompleteListener {
             mWaitingRequests.put(cacheKey, waitingRequests);
             nextInLine.setNetworkRequestCompleteListener(this);
             if (mRequestQueue != null) {
-                mRequestQueue.sendRequestOverNetwork(request);
+                mRequestQueue.sendRequestOverNetwork(nextInLine);
             } else {
                 try {
-                    mNetworkQueue.put(request);
+                    mNetworkQueue.put(nextInLine);
                 } catch (InterruptedException iex) {
                     VolleyLog.e("Couldn't add request to queue. %s", iex.toString());
                     // Restore the interrupted status of the calling thread (i.e. NetworkDispatcher)

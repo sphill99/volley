@@ -21,7 +21,6 @@ import android.content.pm.PackageInfo;
 import android.content.pm.PackageManager.NameNotFoundException;
 import android.net.http.AndroidHttpClient;
 import android.os.Build;
-import androidx.annotation.RequiresApi;
 import com.android.volley.AsyncCache;
 import com.android.volley.AsyncNetwork;
 import com.android.volley.AsyncRequestQueue;
@@ -39,9 +38,7 @@ public class Volley {
     public static AsyncRequestQueue newAsyncRequestQueue(final Context context) {
         CronetHttpStack stack = new CronetHttpStack.Builder(context).build();
         AsyncNetwork network = new BasicAsyncNetwork(stack);
-        File file = new File(
-                context.getApplicationContext().getCacheDir(),
-                DEFAULT_CACHE_DIR);
+        File file = new File(context.getApplicationContext().getCacheDir(), DEFAULT_CACHE_DIR);
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             AsyncCache cache = new DiskBasedAsyncCache(file, 5 * 1024 * 1024);
             return new AsyncRequestQueue.Builder(network).setAsyncCache(cache).build();

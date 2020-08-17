@@ -20,15 +20,25 @@ import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 
 public class AsyncRequestQueue extends RequestQueue {
+    /** Default number of blocking threads to start. */
     private static final int DEFAULT_BLOCKING_THREAD_POOL_SIZE = 4;
-    private final AsyncCache mAsyncCache;
+
+    /** AsyncCache used to retrieve and store responses. Null indicates use of blocking Cache. */
+    @Nullable private final AsyncCache mAsyncCache;
+
+    /** AsyncNetwork used to perform nework requests. */
     private final AsyncNetwork mNetwork;
+
+    /**
+     * Cache used to retrieve and store responses. Only use if an AsyncCache cannot be provided due
+     * to lower API.
+     */
     private final Cache mCache;
-    private final ResponseDelivery mDelivery;
 
     /** Executor for non-blocking tasks. */
     private ExecutorService mNonBlockingExecutor;
 
+    /** Blocking queue to be used to created Executors */
     private static final PriorityBlockingQueue<Runnable> mBlockingQueue =
             new PriorityBlockingQueue<>(
                     11,
@@ -40,8 +50,7 @@ public class AsyncRequestQueue extends RequestQueue {
                             // by the underlying Request.
                             if (r1 instanceof RequestTask) {
                                 if (r2 instanceof RequestTask) {
-                                    return ((RequestTask<?>) r1)
-                                            .compareTo(((RequestTask<?>) r2));
+                                    return ((RequestTask<?>) r1).compareTo(((RequestTask<?>) r2));
                                 }
                                 return 1;
                             }
@@ -57,12 +66,29 @@ public class AsyncRequestQueue extends RequestQueue {
      */
     private ExecutorService mBlockingExecutor;
 
-
+    /**
+     * This interface may be used by advanced applications to provide custom executors according to
+     * their needs. Apps must create ExecutorServices dynamically given a blocking queue rather than
+     * providing them directly so that Volley can provide a PriorityQueue which will prioritize
+     * requests according to Request#getPriority.
+     */
     private ExecutorFactory mExecutorFactory;
 
     /** Manage list of waiting requests and de-duplicate requests with same cache key. */
     private final WaitingRequestManager mWaitingRequestManager;
 
+    /**
+     * Sets all the variables, but processing does not begin until {@link #start()} is called.
+     *
+     * @param cache to use for persisting responses to disk. If an AsyncCache was provided, then
+     *     this will be a {@link ThrowingCache}
+     * @param network to perform HTTP requests
+     * @param asyncCache to use for persisting responses to disk. May be null to indicate use of
+     *     blocking cache
+     * @param responseDelivery interface for posting responses and errors
+     * @param executorFactory Interface to be used to provide custom executors according to the
+     *     users needs.
+     */
     private AsyncRequestQueue(
             Cache cache,
             AsyncNetwork network,
@@ -73,27 +99,27 @@ public class AsyncRequestQueue extends RequestQueue {
         mAsyncCache = asyncCache;
         mCache = cache;
         mNetwork = network;
-        mDelivery = responseDelivery;
         mExecutorFactory = executorFactory;
         mWaitingRequestManager = new WaitingRequestManager(this);
     }
 
+    /** Sets the executors and initializes the cache. */
     @Override
     public void start() {
         stop(); // Make sure any currently running threads are stopped
+
+        // Create blocking / non-blocking executors and set them in the network and stack.
         mNonBlockingExecutor = mExecutorFactory.createNonBlockingExecutor(mBlockingQueue);
         mBlockingExecutor = mExecutorFactory.createBlockingExecutor(mBlockingQueue);
         mNetwork.setBlockingExecutor(mBlockingExecutor);
         mNetwork.setStackCallbackExecutor(mNonBlockingExecutor);
 
-        // TODO: Uncaught exception handler?
         mNonBlockingExecutor.execute(
                 new Runnable() {
                     @Override
                     public void run() {
                         // This is intentionally blocking, because we don't want to process any
-                        // requests
-                        // until the cache is initialized.
+                        // requests until the cache is initialized.
                         if (mAsyncCache != null) {
                             final CountDownLatch latch = new CountDownLatch(1);
                             mAsyncCache.initialize(
@@ -106,7 +132,10 @@ public class AsyncRequestQueue extends RequestQueue {
                             try {
                                 latch.await();
                             } catch (InterruptedException e) {
-                                // TODO: DO SOMETHING
+                                VolleyLog.e(
+                                        e, "Thread was interrupted while initializing the cache.");
+                                Thread.currentThread().interrupt();
+                                throw new RuntimeException(e);
                             }
                         } else {
                             mCache.initialize();
@@ -115,6 +144,7 @@ public class AsyncRequestQueue extends RequestQueue {
                 });
     }
 
+    /** Shuts down and nullifies both executors */
     @Override
     public void stop() {
         if (mNonBlockingExecutor != null) {
@@ -127,20 +157,18 @@ public class AsyncRequestQueue extends RequestQueue {
         }
     }
 
+    /** Begins the request by sending it to the Cache or Network. */
     @Override
-    public <T> Request<T> add(Request<T> request) {
-        request.setRequestQueue(this);
-        request.setSequence(getSequenceNumber());
-        request.addMarker("add-to-queue");
-        beginRequest(request);
-        return request;
-    }
-
     <T> void beginRequest(Request<T> request) {
-        if (mAsyncCache != null) {
-            mNonBlockingExecutor.execute(new AsyncCacheTask<>(request));
+        // If the request is uncacheable, send it over the network.
+        if (request.shouldCache()) {
+            if (mAsyncCache != null) {
+                mNonBlockingExecutor.execute(new CacheTask<>(request));
+            } else {
+                mBlockingExecutor.execute(new CacheTask<>(request));
+            }
         } else {
-            mBlockingExecutor.execute(new CacheTask<>(request));
+            sendRequestOverNetwork(request);
         }
     }
 
@@ -162,34 +190,7 @@ public class AsyncRequestQueue extends RequestQueue {
         }
     }
 
-    private class AsyncCacheTask<T> extends RequestTask<T> {
-        AsyncCacheTask(Request<T> request) {
-            super(request);
-        }
-
-        @Override
-        public void run() {
-            // If the request has been canceled, don't bother dispatching it.
-            if (mRequest.isCanceled()) {
-                mRequest.finish("cache-discard-canceled");
-                return;
-            }
-
-            mRequest.addMarker("cache-queue-take");
-
-            // Attempt to retrieve this item from cache.
-            assert mAsyncCache != null;
-            mAsyncCache.get(
-                    mRequest.getCacheKey(),
-                    new OnGetCompleteCallback() {
-                        @Override
-                        public void onGetComplete(Entry entry) {
-                            handleEntry(entry, mRequest);
-                        }
-                    });
-        }
-    }
-
+    /** Runnable that gets an entry from the cache. */
     private class CacheTask<T> extends RequestTask<T> {
         CacheTask(Request<T> request) {
             super(request);
@@ -206,11 +207,23 @@ public class AsyncRequestQueue extends RequestQueue {
             mRequest.addMarker("cache-queue-take");
 
             // Attempt to retrieve this item from cache.
-            Entry entry = mCache.get(mRequest.getCacheKey());
-            handleEntry(entry, mRequest);
+            if (mAsyncCache != null) {
+                mAsyncCache.get(
+                        mRequest.getCacheKey(),
+                        new OnGetCompleteCallback() {
+                            @Override
+                            public void onGetComplete(Entry entry) {
+                                handleEntry(entry, mRequest);
+                            }
+                        });
+            } else {
+                Entry entry = mCache.get(mRequest.getCacheKey());
+                handleEntry(entry, mRequest);
+            }
         }
     }
 
+    /** Helper method that handles the cache entry after getting it from the Cache. */
     private void handleEntry(final Entry entry, final Request<?> mRequest) {
         if (entry == null) {
             mRequest.addMarker("cache-miss");
@@ -244,7 +257,7 @@ public class AsyncRequestQueue extends RequestQueue {
 
                         if (!entry.refreshNeeded()) {
                             // Completely unexpired cache hit. Just deliver the response.
-                            mDelivery.postResponse(mRequest, response);
+                            getResponseDelivery().postResponse(mRequest, response);
                         } else {
                             // Soft-expired cache hit. We can deliver the cached response,
                             // but we need to also send the request to the network for
@@ -257,26 +270,28 @@ public class AsyncRequestQueue extends RequestQueue {
                             if (!mWaitingRequestManager.maybeAddToWaitingRequests(mRequest)) {
                                 // Post the intermediate response back to the user and have
                                 // the delivery then forward the request along to the network.
-                                mDelivery.postResponse(
-                                        mRequest,
-                                        response,
-                                        new Runnable() {
-                                            @Override
-                                            public void run() {
-                                                sendRequestOverNetwork(mRequest);
-                                            }
-                                        });
+                                getResponseDelivery()
+                                        .postResponse(
+                                                mRequest,
+                                                response,
+                                                new Runnable() {
+                                                    @Override
+                                                    public void run() {
+                                                        sendRequestOverNetwork(mRequest);
+                                                    }
+                                                });
                             } else {
                                 // request has been added to list of waiting requests
                                 // to receive the network response from the first request once it
                                 // returns.
-                                mDelivery.postResponse(mRequest, response);
+                                getResponseDelivery().postResponse(mRequest, response);
                             }
                         }
                     }
                 });
     }
 
+    /** Runnable that performs the network request */
     private class NetworkTask<T> extends RequestTask<T> {
         NetworkTask(Request<T> request) {
             super(request);
@@ -315,59 +330,7 @@ public class AsyncRequestQueue extends RequestQueue {
                             }
 
                             // Parse the response here on the worker thread.
-                            mBlockingExecutor.execute(
-                                    new Runnable() {
-                                        @Override
-                                        public void run() {
-                                            final Response<?> response =
-                                                    mRequest.parseNetworkResponse(networkResponse);
-                                            mRequest.addMarker("network-parse-complete");
-
-                                            // Write to cache if applicable.
-                                            // TODO: Only update cache metadata instead of entire
-                                            // record for 304s.
-                                            if (mRequest.shouldCache()
-                                                    && response.cacheEntry != null) {
-                                                if (mAsyncCache != null) {
-                                                    mNonBlockingExecutor.execute(new Runnable() {
-                                                        @Override
-                                                        public void run() {
-                                                            mAsyncCache.put(
-                                                                    mRequest.getCacheKey(),
-                                                                    response.cacheEntry,
-                                                                    new AsyncCache
-                                                                            .OnWriteCompleteCallback() {
-                                                                        @Override
-                                                                        public void onWriteComplete() {
-                                                                            handleRequestAfterCached(
-                                                                                    response);
-                                                                        }
-                                                                    });
-                                                        }
-                                                    });
-                                                } else {
-                                                    mCache.put(
-                                                            mRequest.getCacheKey(),
-                                                            response.cacheEntry);
-                                                    handleRequestAfterCached(response);
-                                                }
-                                            } else {
-                                                // Post the response back.
-                                                mRequest.markDelivered();
-                                                mDelivery.postResponse(mRequest, response);
-                                                mRequest.notifyListenerResponseReceived(response);
-                                            }
-                                        }
-
-                                        private void handleRequestAfterCached(
-                                                Response<?> response) {
-                                            mRequest.addMarker("network-cache-written");
-                                            // Post the response back.
-                                            mRequest.markDelivered();
-                                            mDelivery.postResponse(mRequest, response);
-                                            mRequest.notifyListenerResponseReceived(response);
-                                        }
-                                    });
+                            mBlockingExecutor.execute(new ParseTask<>(mRequest, networkResponse));
                         }
 
                         @Override
@@ -380,7 +343,7 @@ public class AsyncRequestQueue extends RequestQueue {
                                         public void run() {
                                             VolleyError parsedError =
                                                     mRequest.parseNetworkError(volleyError);
-                                            mDelivery.postError(mRequest, parsedError);
+                                            getResponseDelivery().postError(mRequest, parsedError);
                                             mRequest.notifyListenerResponseNotUsable();
                                         }
                                     });
@@ -389,11 +352,76 @@ public class AsyncRequestQueue extends RequestQueue {
         }
     }
 
+    /** Runnable that parses a network response. */
+    private class ParseTask<T> extends RequestTask<T> {
+        NetworkResponse networkResponse;
+
+        public ParseTask(Request<T> request, NetworkResponse networkResponse) {
+            super(request);
+            this.networkResponse = networkResponse;
+        }
+
+        @Override
+        public void run() {
+            final Response<?> response = mRequest.parseNetworkResponse(networkResponse);
+            mRequest.addMarker("network-parse-complete");
+
+            // Write to cache if applicable.
+            // TODO: Only update cache metadata instead of entire
+            // record for 304s.
+            if (mRequest.shouldCache() && response.cacheEntry != null) {
+                if (mAsyncCache != null) {
+                    mNonBlockingExecutor.execute(
+                            new Runnable() {
+                                @Override
+                                public void run() {
+                                    mAsyncCache.put(
+                                            mRequest.getCacheKey(),
+                                            response.cacheEntry,
+                                            new AsyncCache.OnWriteCompleteCallback() {
+                                                @Override
+                                                public void onWriteComplete() {
+                                                    finishRequest(response, true);
+                                                }
+                                            });
+                                }
+                            });
+                } else {
+                    mCache.put(mRequest.getCacheKey(), response.cacheEntry);
+                    finishRequest(response, true);
+                }
+            } else {
+                finishRequest(response, false);
+            }
+        }
+
+        private void finishRequest(Response<?> response, boolean cached) {
+            if (cached) {
+                mRequest.addMarker("network-cache-written");
+            }
+            // Post the response back.
+            mRequest.markDelivered();
+            getResponseDelivery().postResponse(mRequest, response);
+            mRequest.notifyListenerResponseReceived(response);
+        }
+    }
+
+    /**
+     * This interface may be used by advanced applications to provide custom executors according to
+     * their needs. Apps must create ExecutorServices dynamically given a blocking queue rather than
+     * providing them directly so that Volley can provide a PriorityQueue which will prioritize
+     * requests according to Request#getPriority.
+     */
     public interface ExecutorFactory {
         ExecutorService createNonBlockingExecutor(BlockingQueue<?> taskQueue);
+
         ExecutorService createBlockingExecutor(BlockingQueue<?> taskQueue);
     }
 
+    /**
+     * Builder is used to build an instance of {@link AsyncRequestQueue} from values configured by
+     * the setters.
+     */
     public static class Builder {
         private AsyncCache mAsyncCache;
         private final AsyncNetwork mNetwork;
@@ -412,26 +440,38 @@ public class AsyncRequestQueue extends RequestQueue {
             mCache = null;
         }
 
+        /**
+         * Sets the executor factory to be used by the AsyncRequestQueue. If this is not called, we
+         * will default to calling getDefaultExecutorFactory.
+         */
         public Builder setExecutorFactory(ExecutorFactory executorFactory) {
             mExecutorFactory = executorFactory;
             return this;
         }
 
+        /**
+         * Sets the response deliver to be used by the AsyncRequestQueue. If this is not called, we
+         * will default to creating a new {@link ExecutorDelivery} with the applications main
+         * thread.
+         */
         public Builder setResponseDelivery(ResponseDelivery responseDelivery) {
             mResponseDelivery = responseDelivery;
             return this;
         }
 
+        /** Sets the AsyncCache to be used by the AsyncRequestQueue. */
         public Builder setAsyncCache(AsyncCache asyncCache) {
             mAsyncCache = asyncCache;
             return this;
         }
 
+        /** Sets the Cache to be used by the AsyncRequestQueue. */
         public Builder setCache(Cache cache) {
             mCache = cache;
             return this;
         }
 
+        /** Provides a default ExecutorFactory to use, if one is never set. */
         private ExecutorFactory getDefaultExecutorFactory() {
             return new ExecutorFactory() {
                 @Override
@@ -473,10 +513,13 @@ public class AsyncRequestQueue extends RequestQueue {
         }
 
         public AsyncRequestQueue build() {
+            // If neither cache is set by the caller, throw an illegal argument exception.
             if (mCache == null && mAsyncCache == null) {
                 throw new IllegalArgumentException("You must set one of the cache objects");
             }
             if (mCache == null) {
+                // if no cache is provided, we will provide one that throws
+                // UnsupportedOperationExceptions to pass into the parent class.
                 mCache = new ThrowingCache();
             }
             if (mResponseDelivery == null) {
@@ -486,11 +529,7 @@ public class AsyncRequestQueue extends RequestQueue {
                 mExecutorFactory = getDefaultExecutorFactory();
             }
             return new AsyncRequestQueue(
-                    mCache,
-                    mNetwork,
-                    mAsyncCache,
-                    mResponseDelivery,
-                    mExecutorFactory);
+                    mCache, mNetwork, mAsyncCache, mResponseDelivery, mExecutorFactory);
         }
     }
 }
